@@ -1,0 +1,143 @@
+name: Vercel Deploy
+
+# Builds in GitHub Actions and deploys the prebuilt output with the Vercel CLI.
+# Vercel blocks source deploys whose commit author isn't on the team, but
+# accepts prebuilt output deployed with the team's token.
+#
+# `vercel pull` can't read env vars marked Sensitive and writes "[SENSITIVE]"
+# placeholders; building with those took production down. Their real values
+# come from the VERCEL_SENSITIVE_ENV secret, and the build refuses to run if
+# any placeholder is left. After promoting, the live site is smoke-tested and
+# rolled back on a 5xx.
+#
+# Repo secrets (Settings -> Secrets and variables -> Actions):
+#   VERCEL_TOKEN          token from the Vercel team that owns the project
+#   VERCEL_ORG_ID         team ID (Vercel -> Team Settings -> General)
+#   VERCEL_PROJECT_ID     project ID (Vercel -> Project -> Settings -> General)
+#   VERCEL_SENSITIVE_ENV  KEY=value lines for every Sensitive production var.
+#                         Update it whenever a Sensitive var changes in Vercel.
+on:
+  push:
+    branches:
+      - __BRANCH__
+  workflow_dispatch:
+
+env:
+  VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+  VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+  VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+  PRODUCTION_DOMAIN: __PRODUCTION_DOMAIN__
+
+# One production deploy at a time. Never cancel mid-run: a cancelled run could
+# stop between promote and the smoke test / rollback.
+concurrency:
+  group: vercel-deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm only (reads package.json "packageManager"); delete for npm/yarn.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: __NODE_VERSION__
+          cache: __PACKAGE_MANAGER__   # pnpm | npm | yarn
+
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      - name: Pull Vercel project settings and production env vars
+        run: vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
+
+      - name: Fill in Sensitive env vars
+        env:
+          SENSITIVE_ENV: ${{ secrets.VERCEL_SENSITIVE_ENV }}
+        run: |
+          set -euo pipefail
+          file=.vercel/.env.production.local
+          while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%$'\r'}"
+            case "$line" in ''|'#'*) continue ;; esac
+            key="${line%%=*}"
+            grep -v "^${key}=" "$file" > "$file.tmp" || true
+            mv "$file.tmp" "$file"
+            printf '%s\n' "$line" >> "$file"
+          done <<< "$SENSITIVE_ENV"
+
+          missing="$(grep '\[SENSITIVE\]' "$file" | cut -d= -f1 || true)"
+          if [ -n "$missing" ]; then
+            echo "::error::Add these to the VERCEL_SENSITIVE_ENV secret: $(echo $missing)"
+            exit 1
+          fi
+
+      - name: Build
+        run: vercel build --prod --token="$VERCEL_TOKEN"
+
+      - name: Note the live deployment
+        id: live
+        run: |
+          set -euo pipefail
+          id="$(curl -fsS -H "Authorization: Bearer $VERCEL_TOKEN" \
+            "https://api.vercel.com/v4/aliases/$PRODUCTION_DOMAIN?teamId=$VERCEL_ORG_ID" \
+            | jq -r '.deploymentId // empty')"
+          if [ -z "$id" ]; then
+            echo "::error::Could not find the deployment serving $PRODUCTION_DOMAIN"
+            exit 1
+          fi
+          echo "Currently live: $id"
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy
+        id: deploy
+        run: |
+          set -euo pipefail
+          url="$(vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN")"
+          echo "Deployed: $url"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      # Explicit promote also lifts the domain lock left by an Instant Rollback.
+      # It may refuse when the deploy already went live; the check below is
+      # what decides.
+      - name: Promote to production
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          set -euo pipefail
+          vercel promote "$URL" --yes --timeout=5m --token="$VERCEL_TOKEN" || true
+          new_id="$(curl -fsS -H "Authorization: Bearer $VERCEL_TOKEN" \
+            "https://api.vercel.com/v13/deployments/${URL#https://}?teamId=$VERCEL_ORG_ID" | jq -r '.id')"
+          live_id="$(curl -fsS -H "Authorization: Bearer $VERCEL_TOKEN" \
+            "https://api.vercel.com/v4/aliases/$PRODUCTION_DOMAIN?teamId=$VERCEL_ORG_ID" | jq -r '.deploymentId')"
+          if [ "$new_id" != "$live_id" ]; then
+            echo "::error::$PRODUCTION_DOMAIN still serves $live_id, not the new deploy $new_id"
+            exit 1
+          fi
+          echo "$PRODUCTION_DOMAIN now serves $new_id"
+
+      - name: Smoke test, roll back on failure
+        env:
+          PREVIOUS: ${{ steps.live.outputs.id }}
+        run: |
+          set -uo pipefail
+          check() {
+            local code
+            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://$PRODUCTION_DOMAIN$1")"
+            echo "$1 -> $code"
+            [ "$code" != "000" ] && [ "$code" -lt 500 ]
+          }
+          for attempt in 1 2 3 4 5 6; do
+            if check / && check /login; then
+              echo "Production is healthy."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::$PRODUCTION_DOMAIN is failing; rolling back to $PREVIOUS"
+          vercel rollback "$PREVIOUS" --timeout=5m --token="$VERCEL_TOKEN"
+          exit 1

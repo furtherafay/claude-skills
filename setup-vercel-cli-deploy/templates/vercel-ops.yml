@@ -1,0 +1,54 @@
+name: Vercel Ops
+
+# Manual production recovery with the repo's Vercel token: show a deployment's
+# status/logs, or roll production back to the last READY deploy before a time.
+on:
+  workflow_dispatch:
+    inputs:
+      inspect:
+        description: Deployment URL to inspect (optional).
+        type: string
+        required: false
+      rollback_before:
+        description: Roll back to the last READY production deploy created before this ISO time (empty = no rollback).
+        type: string
+        required: false
+
+env:
+  VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+  VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+  VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+
+jobs:
+  ops:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      - name: Recent production deployments
+        run: |
+          curl -fsS -H "Authorization: Bearer $VERCEL_TOKEN" \
+            "https://api.vercel.com/v6/deployments?projectId=$VERCEL_PROJECT_ID&teamId=$VERCEL_ORG_ID&target=production&limit=10" \
+            | jq -r '.deployments[] | "\(.created/1000 | todate)  \(.state)  \(.source // "-")  \(.url)  \(.meta.githubCommitSha // "" | .[0:7])"'
+
+      - name: Inspect deployment
+        if: inputs.inspect != ''
+        run: |
+          vercel inspect "${{ inputs.inspect }}" --scope "$VERCEL_ORG_ID" --token "$VERCEL_TOKEN" || true
+          timeout 60 vercel inspect "${{ inputs.inspect }}" --logs --scope "$VERCEL_ORG_ID" --token "$VERCEL_TOKEN" | tail -80 || true
+
+      - name: Roll back production
+        if: inputs.rollback_before != ''
+        run: |
+          set -euo pipefail
+          until_ms=$(( $(date -d "${{ inputs.rollback_before }}" +%s) * 1000 ))
+          target=$(curl -fsS -H "Authorization: Bearer $VERCEL_TOKEN" \
+            "https://api.vercel.com/v6/deployments?projectId=$VERCEL_PROJECT_ID&teamId=$VERCEL_ORG_ID&target=production&state=READY&until=$until_ms&limit=1" \
+            | jq -r '.deployments[0].url // empty')
+          if [ -z "$target" ]; then
+            echo "::error::No READY production deployment before ${{ inputs.rollback_before }}"
+            exit 1
+          fi
+          echo "Rolling production back to $target"
+          vercel rollback "$target" --scope "$VERCEL_ORG_ID" --token "$VERCEL_TOKEN" --timeout 3m
